@@ -1,4 +1,4 @@
-# optimal-design-radiation
+# FreeFEM code for "Optimal design problem with thermal radiation"
 
 ## How to run
 ```bash
