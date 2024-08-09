@@ -1,0 +1,387 @@
+func real Projection(mesh &Th, real lambda, real[int] &phiArray, real[int] &projectedArray, real[int] &projected2Array){
+
+	fespace VhS1(Th,P1);
+
+	VhS1 phi; phi[] = phiArray;
+	
+	// compute the projection phi -> projected
+	VhS1 tmp = phi + lambda;
+	VhS1 projected2 = tmp*(tmp<=1.000)*(tmp>=-1.000) + 1.000*(tmp>1.000)  -1.000*(tmp<-1.000);
+	VhS1 projected=projected2*(projected2>0.00)+0.00*(projected2<=0.00);
+	//VhS1 projected=0.5*tanh(projected2/0.01)+0.5;
+
+	projectedArray = projected[];
+	projected2Array = projected2[];
+	
+
+	// return normalized volume
+	return int2d(Th)(projected) / int2d(Th)(1.0);
+}
+
+exec("rm -rf ./output ./tmp");
+exec("mkdir -p ./output ./tmp");
+// include "param.edp"
+
+//
+bool GUI = false;
+
+real qf=0.99;
+real dt=0.2;
+real ep=0.1;
+real tau=5e-7;
+real rho=1.0;
+real w=0;
+
+int  resMesh =20; // mesh resolution
+
+// material const.
+real alpha=1;
+real beta=10;
+
+// physics
+real sw=1;//radiation on;1 off;0
+real gamma=0.1;// approx number for nonlinear boundary term
+real sb=1;//1.92*1e-10; //stefean-boltzmann coeff
+real kk=0;//273.150; // K to C
+real pp=2; // pp=1; Robin, pp=2; Radiation
+
+// Optimization
+real GvMax = 0.6;   // upper limit of the
+int MaxLoop = 2000;
+real conv=0.0001; // convergence criteria
+int FlagOptMax = 30; // period for convergence check
+real stepsize = 0.05;
+
+//
+
+verbosity=0; 	//  Set message level
+load "iovtk" 	// Loading for save vtk file
+// load "PARDISO"
+
+
+//-----------------------------------------------------------
+//  geometry and Mesh
+//-----------------------------------------------------------
+int[int] 		labs(4);						// labels on boundaries of squre: (bottom, right, top, left)
+int[int]		MeshNum(2);						// number of mesh: (x cordinate, y cordinate)
+real[int] 	Pos0(2),Pos1(2);					// Positions of diagonal points of squre: (x cordinate, y cordinate)
+
+mesh 		Shc1;				// Mesh of the squre 1
+labs		= [1,2,3,4];
+MeshNum = [20,20]*resMesh;
+Pos0		= [0.0,0.0];
+Pos1		= [1.0,1.0];
+Shc1 		= square(MeshNum(0),MeshNum(1),[Pos0(0)+(Pos1(0)-Pos0(0))*x,Pos0(1)+(Pos1(1)-Pos0(1))*y],label=labs,flags=1,region=1);
+
+// combine the meshes
+mesh 		Sh=Shc1;//+Shc2+Shc3;
+int[int] traction(4);   traction    = [1,2,3,4];
+
+//-----------------------------------------------------------
+//  Define functional spaces
+//-----------------------------------------------------------
+// functional space for governing and djoint equation
+fespace VhS2(Sh,P2),		VhS1(Sh,P1),			VhS0(Sh,P0);
+fespace VhV2(Sh,[P2,P2]),	VhV1(Sh,[P1,P1]);
+
+//-----------------------------------------------------------
+//  Definition of variables
+//-----------------------------------------------------------
+VhS1 	chkvol, ophiM, ophiP,ophi, oophi, v;					// ophi: previous level set function
+VhS2    Lap;
+
+macro khomm(phi) (alpha+(beta-alpha)*phi)//
+macro ckhomm(phi) (alpha+(beta-alpha)*(0.5*tanh(phi/0.01)+0.5))//
+
+//-----------------------------------------------------------
+//  Define Governing and Ajoint Equations
+//-----------------------------------------------------------
+
+// define displacement
+VhS1 	u,tu, vv, pvv, ff, uold, uuold,  uu,tuu, uad, tv,  LG;
+
+//Setting of gov
+ff=0.001;
+vv=1;
+uold=1;
+uuold=1;
+
+
+
+// governing equation
+problem gov(u,tu)//, solver=LU)
+		=int2d(Sh)(ff*tu)
+		-int2d(Sh)((dx(u)*dx(tu) + dy(u)*dy(tu))*khomm(ophiP))
+		-int1d(Sh,traction)(sw*sb*(pp+1)*(abs(uold))^(pp)*u*tu)
+		+int1d(Sh,traction)(sw*sb*pp*(abs(uold))^(pp)*uold*tu);
+
+
+// ad equation
+problem govad(uad,tv)//, solver=LU)
+		=int2d(Sh)(ff*tv)
+		-int2d(Sh)((dx(uad)*dx(tv) + dy(uad)*dy(tv))*khomm(ophiP))
+		-int1d(Sh,traction)(sw*sb*(pp+1)*abs(u)^(pp-1)*u*uad*tv)
+		-int1d(Sh,traction)(sw*sb*(pp+2)*abs(u)^(pp)*u*tv);
+
+
+
+VhS1 cu, tcu;
+real cuold=1;
+problem cgov(cu,tcu)//, solver=LU)
+		=int2d(Sh)(ff*tcu)
+		-int2d(Sh)((dx(cu)*dx(tcu) + dy(cu)*dy(tcu))*ckhomm(ophi))
+		-int1d(Sh,traction)(sw*sb*(pp+1)*(abs(cuold))^(pp)*cu*tcu)
+		+int1d(Sh,traction)(sw*sb*pp*(abs(cuold))^(pp)*cuold*tcu);
+
+
+
+//-----------------------------------------------------------
+//  Define NLD and Initial LSF
+//-----------------------------------------------------------
+// level set function and its test function
+VhS1 		phi,Vphi;
+
+real 		AbsTd1;
+//macro chiV(phi)  ( (0.5+phi*(15./16-phi^2*(5./8-3./16*phi^2)))*(phi>=-1.0)*(phi<=1.0)+1.*(phi>1.0))//
+macro chiV(phi)  ( (0.5+0.5*tanh(phi/0.1)))//*(phi>=-1.0)*(phi<=1.0)+1.*(phi>1.0))//
+macro Td1 (u,uad) (((beta-alpha)*chiV(ophi)+0)*(dx(u)*dx(uad) + dy(u)*dy(uad)))
+
+// nld
+problem lnld(phi,Vphi)
+=int2d(Sh)((rho*(abs(ophi))^(qf-1))*(phi*Vphi/dt)+(dx(phi)*dx(Vphi)+dy(phi)*dy(Vphi))*tau)
+-int2d(Sh)((Td1(u,uad)/AbsTd1+(rho*(abs(ophi))^(qf-1)*ophi)/dt)*Vphi);
+//+on(traction,phi=0);
+
+
+real ophio;
+// Nonlinear Diffusion via Newton's method 
+//problem nld(phi,Vphi)
+//=
+//int2d(Sh)(qf*(abs(ophio))^(qf-2)*ophio*phi*(Vphi/dt))
+//+int2d(Sh)(((abs(ophio))^(qf-1)*ophio-qf*(abs(ophio))^(qf-1)*ophio)*(Vphi/dt))
+//+int2d(Sh)((dx(phi)*dx(Vphi)+dy(phi)*dy(Vphi))*tau)
+//-int2d(Sh)((CdF*(Td1(u,ophi)/AbsTd1)+(abs(ophi)^(qf-1)*ophi/dt))*Vphi)
+//+on(traction,phi=0);
+
+
+// Nonlinear Diffusion via Newton's method
+problem nld(phi,Vphi)
+=int2d(Sh)(qf/(abs(ophio))^(qf-1)*phi*(Vphi/dt))
+-int2d(Sh)((qf-1)/(abs(ophio))^(qf-1)*ophio*(Vphi/dt))
++int2d(Sh)((dx(phi)*dx(Vphi)+dy(phi)*dy(Vphi))*tau)
+-int2d(Sh)(((Td1(u,ophi)/AbsTd1)+(abs(ophi)^(qf-1)*ophi/dt))*Vphi);
+//+on(traction,phi=0);
+
+
+/////////////////////////////
+//  Initialize Level Sets
+/////////////////////////////
+phi 		= GvMax;//
+//phi 		= 2.0*(((0.6-x)>0)-0.5);			//	initialize level set function
+//phi 		= 1.*(max(cos(20*x*pi),cos(20*y*pi))+0.03);
+ophi 		= phi*(phi<=1.0)*(phi>=-1.0)+1.*(phi>1.0)-1.*(phi<-1.0); //  ophi is mapped to satisfy the upper and lower constraints.
+ophiP=ophi*(ophi>=0)+0.*(ophi<0);
+ophiM=0*(ophi>=0)+ophi*(ophi<0);
+//chk1=ophi;
+//Sen=ophi;//p^(0.001);
+
+
+//  Initialize Level Sets
+//ophi	=phi;
+oophi   =ophi;
+ophio=1;//ophi;
+
+
+//-----------------------------------------------------------
+//  Define objective functions and constraint functions
+//-----------------------------------------------------------
+real obj;				//objective function
+real cobj;				//objective function
+real volFDD;		volFDD 	= int2d(Sh)(1.); 		// volume of the fixed design domain
+// normalized volume
+real vol;
+// constraint functional for volume constraint
+real Gv;
+
+real ww;
+
+//------------
+// Start
+//------------
+
+
+  //-----------------------------------------------------------
+	
+	cout	<<"+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++"<<endl;
+	cout	<< "!!!	number of triangles   maximum edge size "<<endl;
+	cout	<<"+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++"<<endl;
+	cout	<< "!!!            "<<Sh.nt<<"            "<<Sh.hmax<<endl;
+
+
+
+int  FlagOpt = 0; // flag for check convergence
+for (int iter=0;iter<MaxLoop;iter++) {
+
+    //------------------------------
+	//  Solve Governing Equations
+	//------------------------------
+    for (int ii=0;ii<=100;ii++) {
+        gov;
+        uold=u;
+       // cgov;
+        //cuold=cu;
+
+        real www = int2d(Sh)(ff*u)-int2d(Sh)((dx(u)*dx(u) + dy(u)*dy(u))*khomm(ophiP))-int1d(Sh,traction)(sw*sb*(abs(u))^(pp+2));
+        //real norm = int2d(Sh)(ff*u);
+
+        // convergence check
+        if(abs(www) < 1e-5) break;
+    }
+
+    //------------------------------
+	//  Solve Adjoint Equations
+	//------------------------------
+    	govad;
+		//uad=u;
+    //----------------------------------------------
+	//  Compute Objective and Constraint functions
+	//----------------------------------------------
+    	obj = int2d(Sh)((dx(u)*dx(u) + dy(u)*dy(u))*khomm(ophiP));//+(tau/2)*int2d(Sh)(dx(ophi)*dx(ophi)+dy(ophi)*dy(ophi));
+        cobj =1;// int2d(Sh)((dx(cu)*dx(cu) + dy(cu)*dy(cu))*ckhomm(ophi));//+(tau/2)*int2d(Sh)(dx(ophi)*dx(ophi)+dy(ophi)*dy(ophi));
+    	
+    	//obj=int2d(Sh)(ff*(u+kk))-int1d(Sh,traction)(sw*sb*(abs(u+kk))^(pp+2));//+(tau/2)*int2d(Sh)(dx(ophi)*dx(ophi)+dy(ophi)*dy(ophi));
+		
+    //int2d(Sh)(ff*(u+kk))
+    // compute volume
+		vol 	 	= int2d(Sh)(ophiP);
+	//	vol 	 	= int2d(Sh)(ckhomm(ophi));
+
+		Gv 			= vol/volFDD-GvMax;			// volume constraint functional
+
+  
+
+    //-----------------------------------------------------------
+	//  Export Data
+	//-----------------------------------------------------------
+	//  Display
+	
+
+	if(iter==0){
+		cout	<<"+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++"<<endl;
+		cout	<< "!!!	Flag   i        cc             Gv                  ww          obj             cobj          "        <<endl;
+		cout	<<"+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++"<<endl;
+	}
+
+	cout	<< "!!!	"<<FlagOpt<<"   "<<iter<<"   "<<w<<"      "<<Gv<<"    "<<ww<<"     "<<obj<<"       "<<cobj          <<  endl;
+
+    //  Add log file
+	    {
+	        ofstream f("./output/history.dat",append);
+	        f << iter << " " << obj << "  " << cobj << "  " << w<< "  " << Gv <<   "\n";
+	    }
+
+
+	    // save vtu file for paraview
+	    string FNiter	= iter;
+	    int[int] order  =[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1];
+	     savevtk("data_"+FNiter+".vtu", Sh,ophi,u,ophiP, order = order, dataname ="lsf u lsf+",append=iter>1?1:0);
+
+	    //---------
+	    // Plot
+	    //---------
+	    //if(GUI) plot(ophi,cmm="oophi",fill=1,wait=false,boundary=false,WindowIndex=0);
+	    plot(ophi,cmm="ophi",fill=1,wait=false,boundary=false,WindowIndex=0,value=true);
+		
+
+	//---------------------
+	//  Check Convergence
+	//---------------------
+	if (w<=conv) {
+			FlagOpt++;
+			if(FlagOpt>FlagOptMax){ break;}
+	}
+	else{
+		FlagOpt = 0;
+	}
+
+	//-----------------------------------------------------------
+	//  Compute Lagrange Multipliers and several normalizers
+	//-----------------------------------------------------------
+	//  Compute Normarizers
+
+	if(iter==0){
+	//AbsTd1 = 1;
+	AbsTd1 = int2d(Sh)(abs(Td1(u,uad)))/volFDD;
+	}
+
+	//-----------------------------------------------------------
+	//  map LSF to "ophi"
+	//-----------------------------------------------------------
+	oophi = ophi;
+
+	// Update
+	// (i) Newton's method	
+	//if(iter==0){
+		//for (int ii=0;ii<=1;ii++) {
+        //ophio=phi;
+        //nld;
+        //ophi=phi;
+    //}
+	//}
+	// (ii) formal linearization	
+	lnld;
+	// criterion 	
+    ww=int2d(Sh)((rho*(abs(phi))^(qf-1))*(phi*phi/dt)+(dx(phi)*dx(phi)+dy(phi)*dy(phi))*tau)-int2d(Sh)((Td1(u,uad)/AbsTd1+(rho*(abs(ophi))^(qf-1)*ophi)/dt)*phi);
+          
+    // convergence check
+       // if(abs(ww) < 1e-5) break;
+	//}
+	
+
+	//---------------------------------
+	// Bisection search to find lambda
+	//---------------------------------
+
+	chkvol = phi*(phi<=1.0)*(phi>=0)+1.*(phi>1.0)+0.*(phi<0); 
+	real chkvol2=int2d(Sh)(chkvol-GvMax);
+	if(chkvol2<=0){
+
+		ophi=phi*(phi<=1.0)*(phi>=-1)+1.*(phi>1.0)-1.*(phi<-1);
+	}
+    
+
+	else{
+	real lambda;
+	{
+		VhS1 projected, projected2;
+		real lambda0 = -1.0; // initial guess -> vol=0
+		real lambda1 = +1.0; // initial guess -> vol=1
+
+		while(true){
+			// compute volume at the center
+			lambda = (lambda0 + lambda1) / 2;
+			real tmp = Projection(Sh, lambda, phi[], projected[], projected2[]);
+			if(GUI) plot(projected, value=true,fill=true);
+
+			if(tmp < GvMax){
+				lambda0 = lambda;
+			}
+			else{
+				lambda1 = lambda;
+			}
+
+			//cout << tmp << endl;
+			if(abs(tmp - GvMax) <=1e-4) break;
+		}
+	}
+
+	Projection(Sh, lambda, phi[], ophiP[],ophi[]);
+	}
+
+	//stepsize=stepsize/1.01;
+	// convergence condition
+	v=abs(ophi-oophi);
+	//w=intv[].max; //L^\infty norm
+	w=int2d(Sh)(v); //L^1 norm
+		
+}
